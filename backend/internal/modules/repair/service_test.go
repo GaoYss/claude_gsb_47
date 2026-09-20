@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/require"
@@ -15,14 +16,16 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/settlement"
 )
 
 // harness 使用内存数据库装配真实模块, 用于验证跨模块业务流程。
 type harness struct {
-	lamps   *lamp.Service
-	faults  *fault.Service
-	repairs *repair.Service
-	db      *gorm.DB
+	lamps       *lamp.Service
+	faults      *fault.Service
+	repairs     *repair.Service
+	settlements *settlement.Service
+	db          *gorm.DB
 }
 
 func newHarness(t *testing.T) *harness {
@@ -38,7 +41,8 @@ func newHarness(t *testing.T) *harness {
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
 
-	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{}))
+	require.NoError(t, db.AutoMigrate(&lamp.Lamp{}, &fault.Fault{}, &repair.Repair{},
+		&settlement.Settlement{}, &settlement.SettlementItem{}, &settlement.SettlementFlow{}))
 
 	lampRepository := lamp.NewRepository(db)
 	lampService := lamp.NewService(lampRepository)
@@ -50,7 +54,14 @@ func newHarness(t *testing.T) *harness {
 	repairRepository := repair.NewRepository(db)
 	repairService := repair.NewService(repairRepository, faultService)
 
-	return &harness{lamps: lampService, faults: faultService, repairs: repairService, db: db}
+	settlementRepository := settlement.NewRepository(db)
+	settlementService := settlement.NewService(settlementRepository, db)
+	repairService.SetSettlementLock(settlementService)
+
+	return &harness{
+		lamps: lampService, faults: faultService, repairs: repairService,
+		settlements: settlementService, db: db,
+	}
 }
 
 func (h *harness) createLamp(t *testing.T, code string) *lamp.Lamp {
@@ -237,4 +248,81 @@ func TestFaultValidation(t *testing.T) {
 	// 存在未闭环故障时不允许删除路灯
 	h.createFault(t, device.ID, "删除校验")
 	requireConflict(t, h.lamps.Delete(ctx, device.ID))
+}
+
+// TestRepairLockedBySettlement 验证已进入结算流程的班组月份, 其维修记录不能完工/删除。
+func TestRepairLockedBySettlement(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+
+	// 第一条: 完工后用于建账并审核通过, 已通过月份不允许删除
+	deviceA := h.createLamp(t, "LD-T-101")
+	faultA, err := h.faults.Create(ctx, fault.CreateRequest{
+		LampID: deviceA.ID, FaultType: "灯不亮", Description: "需要结算锁定的已完工记录",
+		ReportedAt: time.Date(2026, 3, 5, 8, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	finished, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: faultA.ID, Repairman: "维修工甲", RepairTeam: "结算班组",
+		StartedAt: time.Date(2026, 3, 5, 9, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	cost := 120.0
+	finished, err = h.repairs.Finish(ctx, finished.ID, repair.FinishRequest{
+		Result:     repair.ResultFixed,
+		FinishedAt: time.Date(2026, 3, 5, 11, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+		Cost:       &cost,
+	})
+	require.NoError(t, err)
+	require.Equal(t, repair.StatusFinished, finished.Status)
+
+	created, err := h.settlements.Create(ctx,
+		settlement.CreateRequest{RepairTeam: "结算班组", Period: "2026-03"})
+	require.NoError(t, err)
+	require.Equal(t, 1, created.RecordCount)
+	require.InDelta(t, 120.0, created.TotalAmount, 0.001)
+	_, err = h.settlements.Submit(ctx, created.ID, settlement.SubmitRequest{Reason: "提交"})
+	require.NoError(t, err)
+	_, err = h.settlements.Approve(ctx, created.ID, settlement.AuditRequest{Reason: "通过"})
+	require.NoError(t, err)
+
+	// 已通过月份的已完工维修记录删除被锁定端口拦截
+	err = h.repairs.Delete(ctx, finished.ID)
+	requireConflict(t, err)
+
+	// 第二条: 进行中的维修, 待审核结算单期间不允许在该月完工入账
+	deviceB := h.createLamp(t, "LD-T-102")
+	faultB, err := h.faults.Create(ctx, fault.CreateRequest{
+		LampID: deviceB.ID, FaultType: "灯不亮", Description: "结算期间新完工应被拦截",
+		ReportedAt: time.Date(2026, 3, 10, 7, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	ongoing, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: faultB.ID, Repairman: "维修工乙", RepairTeam: "结算班组",
+		StartedAt: time.Date(2026, 3, 10, 8, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, ongoing.ID, repair.FinishRequest{
+		Result:     repair.ResultFixed,
+		FinishedAt: time.Date(2026, 3, 10, 10, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	requireConflict(t, err)
+
+	// 其它班组同期完工不受影响
+	deviceC := h.createLamp(t, "LD-T-103")
+	faultC, err := h.faults.Create(ctx, fault.CreateRequest{
+		LampID: deviceC.ID, FaultType: "灯不亮", Description: "其它班组不受锁定影响",
+		ReportedAt: time.Date(2026, 3, 10, 7, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	other, err := h.repairs.Create(ctx, repair.CreateRequest{
+		FaultID: faultC.ID, Repairman: "维修工丙", RepairTeam: "其它班组",
+		StartedAt: time.Date(2026, 3, 10, 8, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
+	_, err = h.repairs.Finish(ctx, other.ID, repair.FinishRequest{
+		Result:     repair.ResultFixed,
+		FinishedAt: time.Date(2026, 3, 10, 10, 0, 0, 0, time.Local).Format("2006-01-02 15:04:05"),
+	})
+	require.NoError(t, err)
 }

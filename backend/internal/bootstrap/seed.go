@@ -1,6 +1,7 @@
 package bootstrap
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"streetlight/internal/modules/fault"
 	"streetlight/internal/modules/lamp"
 	"streetlight/internal/modules/repair"
+	"streetlight/internal/modules/settlement"
 )
 
 const hour = time.Hour
@@ -24,6 +26,11 @@ type seedRepairCase struct {
 	content     string
 	materials   string
 	cost        float64
+	// 以下三个绝对时间用于需要落在指定日历月的结算演示案例, 非空时优先于 *Ago。
+	reportedAt time.Time
+	startedAt  time.Time
+	finishedAt time.Time
+	closedAt   time.Time
 }
 
 // seedFaultCase 描述一条演示故障记录。
@@ -38,6 +45,9 @@ type seedFaultCase struct {
 	status      string
 	closed      bool
 	repairs     []seedRepairCase
+	// reportedAt / closedAt 非空时使用绝对时间, 用于需要落在指定日历月的结算演示案例。
+	reportedAt time.Time
+	closedAt   time.Time
 }
 
 // seed 在数据库为空时写入演示数据, 便于启动后立即体验完整业务流程。
@@ -56,12 +66,15 @@ func seed(db *gorm.DB) error {
 		return fmt.Errorf("写入路灯台账演示数据失败: %w", err)
 	}
 
-	cases := seedFaultCases()
+	cases := append(seedFaultCases(), seedSettlementFaultCases(now)...)
 	faults := make([]fault.Fault, 0, len(cases))
 	sequences := map[string]int{}
 	for _, item := range cases {
 		device := lamps[item.lampIndex]
 		reportedAt := now.Add(-item.reportedAgo)
+		if !item.reportedAt.IsZero() {
+			reportedAt = item.reportedAt
+		}
 		prefix := "GD" + reportedAt.Format("20060102")
 		sequences[prefix]++
 
@@ -92,6 +105,9 @@ func seed(db *gorm.DB) error {
 		start := len(repairs)
 		for _, expect := range item.repairs {
 			startedAt := now.Add(-expect.startedAgo)
+			if !expect.startedAt.IsZero() {
+				startedAt = expect.startedAt
+			}
 			prefix := "WX" + startedAt.Format("20060102")
 			sequences[prefix]++
 
@@ -110,7 +126,11 @@ func seed(db *gorm.DB) error {
 				Materials:    expect.materials,
 				Cost:         expect.cost,
 			}
-			if expect.finishedAgo > 0 {
+			if !expect.finishedAt.IsZero() {
+				record.FinishedAt = &expect.finishedAt
+				record.Status = repair.StatusFinished
+				record.Result = expect.result
+			} else if expect.finishedAgo > 0 {
 				finishedAt := now.Add(-expect.finishedAgo)
 				record.FinishedAt = &finishedAt
 				record.Status = repair.StatusFinished
@@ -134,6 +154,9 @@ func seed(db *gorm.DB) error {
 		}
 		if item.closed {
 			closedAt := now.Add(-item.reportedAgo / 2)
+			if !item.closedAt.IsZero() {
+				closedAt = item.closedAt
+			}
 			columns["closed_at"] = closedAt
 			columns["close_remark"] = "现场已恢复照明并复核确认, 故障闭环"
 		}
@@ -146,12 +169,88 @@ func seed(db *gorm.DB) error {
 		return err
 	}
 
+	settlementCount, err := seedSettlements(db, now)
+	if err != nil {
+		return err
+	}
+
 	slog.Info("演示数据初始化完成",
 		"路灯", len(lamps),
 		"故障", len(faults),
 		"维修记录", len(repairs),
+		"结算单", settlementCount,
 	)
 	return nil
+}
+
+// seedSettlements 生成演示结算单: 上月一班已通过、上月二班驳回后重提再通过、本月一班待审核。
+func seedSettlements(db *gorm.DB, now time.Time) (int, error) {
+	year, month := now.Year(), now.Month()
+	thisMonth := time.Date(year, month, 1, 0, 0, 0, 0, now.Location())
+	lastMonthStart := thisMonth.AddDate(0, -1, 0)
+	lastPeriod := lastMonthStart.Format("2006-01")
+	thisPeriod := thisMonth.Format("2006-01")
+
+	repo := settlement.NewRepository(db)
+	svc := settlement.NewService(repo, db)
+	ctx := context.Background()
+
+	// 1) 二班上月: 提交 -> 驳回 -> 修正维修记录班组归属 -> 重新提交, 形成版本差异(待审核)。
+	teamTwo, err := svc.Create(ctx, settlement.CreateRequest{RepairTeam: "市政照明二班", Period: lastPeriod})
+	if err != nil {
+		return 0, fmt.Errorf("创建二班上月结算演示单失败: %w", err)
+	}
+	if _, err := svc.Submit(ctx, teamTwo.ID, settlement.SubmitRequest{Operator: "陈鹏", Reason: "上月维修费用申报"}); err != nil {
+		return 0, err
+	}
+	if _, err := svc.Reject(ctx, teamTwo.ID, settlement.AuditRequest{
+		Operator: "财务-周敏",
+		Reason:   "经核对, 本月有 1 张维修单的作业班组登记与实际不符, 请核实维修记录后重新提交",
+	}); err != nil {
+		return 0, err
+	}
+
+	// 将误归入二班的那条维修单(灯具频闪)调整到一班, 使重提版本出现"移除 1 条、金额 -150"的差异。
+	if err := db.Model(&repair.Repair{}).
+		Where("repair_team = ? AND finished_at >= ? AND finished_at < ?",
+			"市政照明二班", lastMonthStart, thisMonth).
+		Where("materials LIKE ?", "%驱动电源%").
+		Update("repair_team", "市政照明一班").Error; err != nil {
+		return 0, fmt.Errorf("修正演示维修单班组归属失败: %w", err)
+	}
+
+	if _, err := svc.Resubmit(ctx, teamTwo.ID, settlement.SubmitRequest{
+		Operator: "陈鹏",
+		Reason:   "已将误登为二班的维修单调整至一班, 重新归集后提交",
+	}); err != nil {
+		return 0, err
+	}
+	if _, err := svc.Approve(ctx, teamTwo.ID, settlement.AuditRequest{Operator: "财务-周敏", Reason: "复核差异无误, 准予结算"}); err != nil {
+		return 0, err
+	}
+
+	// 2) 一班上月: 在班组归属调整完成后建账, 归集 3 条记录, 提交后审核通过(已结算锁定)。
+	teamOne, err := svc.Create(ctx, settlement.CreateRequest{RepairTeam: "市政照明一班", Period: lastPeriod})
+	if err != nil {
+		return 0, fmt.Errorf("创建一班上月结算演示单失败: %w", err)
+	}
+	if _, err := svc.Submit(ctx, teamOne.ID, settlement.SubmitRequest{Operator: "刘志强", Reason: "上月维修费用台账核对无误, 申请结算"}); err != nil {
+		return 0, err
+	}
+	if _, err := svc.Approve(ctx, teamOne.ID, settlement.AuditRequest{Operator: "财务-周敏", Reason: "票据与工时齐全, 金额与维修记录一致, 准予结算"}); err != nil {
+		return 0, err
+	}
+
+	// 3) 一班本月: 已提交待审核; 二班本月不建账, 台账中体现为待结算。
+	pending, err := svc.Create(ctx, settlement.CreateRequest{RepairTeam: "市政照明一班", Period: thisPeriod})
+	if err != nil {
+		return 0, fmt.Errorf("创建一班本月结算演示单失败: %w", err)
+	}
+	if _, err := svc.Submit(ctx, pending.ID, settlement.SubmitRequest{Operator: "刘志强", Reason: "本月费用申报, 等待财务审核"}); err != nil {
+		return 0, err
+	}
+
+	return 3, nil
 }
 
 // buildSeedLamps 生成 6 条道路共 30 盏路灯的台账数据。
@@ -342,6 +441,113 @@ func seedFaultCases() []seedFaultCase {
 				{
 					repairman: "刘志强", team: "市政照明一班", startedAgo: 12 * hour,
 					content: "拆检控制箱, 正在逐路测量回路电流", materials: "万用表、绝缘胶带", cost: 40,
+				},
+			},
+		},
+	}
+}
+
+// seedSettlementFaultCases 返回费用结算演示案例, 使用绝对时间落在指定日历月。
+func seedSettlementFaultCases(now time.Time) []seedFaultCase {
+	year, month := now.Year(), now.Month()
+	thisMonthStart := time.Date(year, month, 1, 0, 0, 0, 0, now.Location())
+	lastMonthStart := thisMonthStart.AddDate(0, -1, 0)
+	day := func(base time.Time, d int, h, m int) time.Time {
+		return time.Date(base.Year(), base.Month(), d, h, m, 0, 0, now.Location())
+	}
+	// 当月案例需保证不晚于当前时间: 当前为月初时退到前一天。
+	demoDay := 12
+	if now.Day() <= 12 {
+		demoDay = now.Day() - 1
+	}
+	if demoDay < 1 {
+		demoDay = 1
+	}
+
+	return []seedFaultCase{
+		{
+			lampIndex: 14, faultType: "线路故障", level: fault.LevelNormal, source: fault.SourceCitizen,
+			description: "地埋线路接头老化, 分批更换处理", reporter: "李梅",
+			status: fault.StatusClosed, closed: true,
+			reportedAt: day(lastMonthStart, 12, 9, 0),
+			closedAt:   day(lastMonthStart, 14, 10, 0),
+			repairs: []seedRepairCase{
+				{
+					repairman: "刘志强", team: "市政照明一班",
+					startedAt:  day(lastMonthStart, 12, 10, 0),
+					finishedAt: day(lastMonthStart, 12, 12, 30),
+					result:     repair.ResultPendingParts,
+					content:    "排查确认接头老化, 等待防水接头物料", materials: "绝缘胶带 1 卷", cost: 80,
+				},
+				{
+					repairman: "刘志强", team: "市政照明一班",
+					startedAt:  day(lastMonthStart, 13, 14, 0),
+					finishedAt: day(lastMonthStart, 13, 17, 0),
+					result:     repair.ResultFixed,
+					content:    "更换防水接头并复测绝缘合格", materials: "防水接头 4 套", cost: 380,
+				},
+			},
+		},
+		{
+			lampIndex: 15, faultType: "灯具破损", level: fault.LevelNormal, source: fault.SourceInspection,
+			description: "灯罩被高空坠物砸裂, 更换灯头", reporter: "王建国",
+			status: fault.StatusClosed, closed: true,
+			reportedAt: day(lastMonthStart, 18, 8, 30),
+			closedAt:   day(lastMonthStart, 19, 9, 0),
+			repairs: []seedRepairCase{
+				{
+					repairman: "陈鹏", team: "市政照明二班",
+					startedAt:  day(lastMonthStart, 18, 9, 0),
+					finishedAt: day(lastMonthStart, 18, 11, 30),
+					result:     repair.ResultFixed,
+					content:    "整体更换灯头并做密封处理", materials: "LED 灯头 1 套", cost: 280,
+				},
+			},
+		},
+		{
+			lampIndex: 16, faultType: "灯具常亮", level: fault.LevelLow, source: fault.SourceMonitoring,
+			description: "白天灯具常亮, 更换接触器后恢复", reporter: "监控中心",
+			status:     fault.StatusRepaired,
+			reportedAt: day(thisMonthStart, demoDay, 8, 0),
+			repairs: []seedRepairCase{
+				{
+					repairman: "陈鹏", team: "市政照明二班",
+					startedAt:  day(thisMonthStart, demoDay, 9, 0),
+					finishedAt: day(thisMonthStart, demoDay, 11, 0),
+					result:     repair.ResultFixed,
+					content:    "更换交流接触器, 远程开关灯恢复正常", materials: "交流接触器 1 只", cost: 320,
+				},
+			},
+		},
+		{
+			lampIndex: 17, faultType: "灯不亮", level: fault.LevelHigh, source: fault.SourceCitizen,
+			description: "驱动电源与接线端子同时损坏, 已处理待复核", reporter: "张伟",
+			status: fault.StatusClosed, closed: true,
+			reportedAt: day(thisMonthStart, demoDay, 8, 30),
+			closedAt:   day(thisMonthStart, demoDay, 16, 0),
+			repairs: []seedRepairCase{
+				{
+					repairman: "刘志强", team: "市政照明一班",
+					startedAt:  day(thisMonthStart, demoDay, 9, 0),
+					finishedAt: day(thisMonthStart, demoDay, 14, 30),
+					result:     repair.ResultFixed,
+					content:    "更换驱动电源并重新压接接线端子", materials: "驱动电源 1 个, 接线端子 6 个", cost: 670,
+				},
+			},
+		},
+		{
+			lampIndex: 18, faultType: "灯光闪烁", level: fault.LevelLow, source: fault.SourceOther,
+			description: "灯具频闪, 初判为驱动问题, 班组归属登记有误(演示驳回重提)", reporter: "社区网格员",
+			status: fault.StatusClosed, closed: true,
+			reportedAt: day(lastMonthStart, 22, 9, 0),
+			closedAt:   day(lastMonthStart, 22, 12, 0),
+			repairs: []seedRepairCase{
+				{
+					repairman: "陈鹏", team: "市政照明二班",
+					startedAt:  day(lastMonthStart, 22, 9, 30),
+					finishedAt: day(lastMonthStart, 22, 11, 30),
+					result:     repair.ResultFixed,
+					content:    "更换驱动电源后频闪消除", materials: "驱动电源 1 个", cost: 150,
 				},
 			},
 		},

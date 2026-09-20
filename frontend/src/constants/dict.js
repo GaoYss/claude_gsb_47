@@ -44,6 +44,31 @@ export const REPAIR_RESULT = {
   unfixable: { label: '无法修复', type: 'danger' },
 }
 
+// 费用结算单状态。
+export const SETTLEMENT_STATUS = {
+  draft: { label: '草稿', type: 'info' },
+  submitted: { label: '待审核', type: 'warning' },
+  approved: { label: '已通过', type: 'success' },
+  rejected: { label: '已驳回', type: 'danger' },
+}
+
+// 结算单流转动作。
+export const SETTLEMENT_ACTION = {
+  create: { label: '建账', type: 'primary' },
+  submit: { label: '提交', type: 'warning' },
+  reject: { label: '驳回', type: 'danger' },
+  resubmit: { label: '重新提交', type: 'warning' },
+  approve: { label: '审核通过', type: 'success' },
+  rebuild: { label: '重新归集', type: 'info' },
+}
+
+// 版本明细差异类型。
+export const SETTLEMENT_DIFF_TYPE = {
+  added: { label: '新增', type: 'success' },
+  removed: { label: '移除', type: 'danger' },
+  changed: { label: '费用变更', type: 'warning' },
+}
+
 // 追踪时间线的节点名称。
 export const TIMELINE_STAGE = {
   reported: { label: '故障登记', type: 'primary' },

@@ -26,6 +26,9 @@ func New(db *gorm.DB, faults FaultPort) *Module {
 // Repository 暴露仓储, 供状态查询模块装配。
 func (m *Module) Repository() *Repository { return m.repository }
 
+// Service 暴露服务, 供费用结算模块注入锁定端口。
+func (m *Module) Service() *Service { return m.service }
+
 // Name 实现 module.Module 接口。
 func (m *Module) Name() string { return "维修记录" }
 

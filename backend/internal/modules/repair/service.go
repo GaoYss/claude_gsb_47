@@ -33,15 +33,39 @@ type FaultPort interface {
 	SyncRepairStats(ctx context.Context, faultID uint, repairCount int, latestRepairID *uint) error
 }
 
+// SettlementLock 由费用结算模块实现, 维修记录改动前校验其完工月份是否已进入结算流程。
+type SettlementLock interface {
+	// EnsureRepairMutable 在班组某完工月份存在待审核/已通过结算单时返回冲突错误。
+	EnsureRepairMutable(ctx context.Context, team string, finishedAt time.Time) error
+}
+
 // Service 承载维修记录录入的业务规则。
 type Service struct {
 	repo   *Repository
 	faults FaultPort
+	locks  []SettlementLock
 }
 
 // NewService 构造维修记录服务。
 func NewService(repo *Repository, faults FaultPort) *Service {
 	return &Service{repo: repo, faults: faults}
+}
+
+// SetSettlementLock 注入费用结算锁定端口, 避免与结算模块形成构造循环依赖。
+func (s *Service) SetSettlementLock(lock SettlementLock) {
+	if lock != nil {
+		s.locks = append(s.locks, lock)
+	}
+}
+
+// ensureMutable 校验已完工维修记录所属班组月份未被结算锁定。
+func (s *Service) ensureMutable(ctx context.Context, team string, finishedAt time.Time) error {
+	for _, lock := range s.locks {
+		if err := lock.EnsureRepairMutable(ctx, team, finishedAt); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Get 查询维修记录详情。
@@ -207,6 +231,11 @@ func (s *Service) Finish(ctx context.Context, id uint, req FinishRequest) (*Repa
 		return nil, apperr.BadRequest("完工时间不能早于开工时间")
 	}
 
+	// 已进入结算流程(待审核/已通过)的班组月份不允许再完工入账, 保证结算金额与维修记录一致。
+	if err := s.ensureMutable(ctx, entity.RepairTeam, finishedAt); err != nil {
+		return nil, err
+	}
+
 	entity.FinishedAt = &finishedAt
 	entity.Status = StatusFinished
 	entity.Result = result
@@ -247,6 +276,12 @@ func (s *Service) Delete(ctx context.Context, id uint) error {
 	}
 	if target.Status == fault.StatusClosed {
 		return apperr.Conflict("故障 %s 已关闭, 不允许删除其维修记录", target.FaultNo)
+	}
+	// 已完工记录若所属班组月份已进入结算流程, 不允许删除。
+	if entity.Status == StatusFinished && entity.FinishedAt != nil {
+		if err := s.ensureMutable(ctx, entity.RepairTeam, *entity.FinishedAt); err != nil {
+			return err
+		}
 	}
 
 	if err := s.repo.Delete(ctx, id); err != nil {

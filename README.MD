@@ -17,9 +17,10 @@
 | 路灯台账 | 路灯基础档案维护 | 编号/道路/运行状态/灯具类型筛选, 按道路与状态统计, 删除前校验未闭环故障 |
 | 故障登记 | 故障工单登记与流转 | 自动生成故障单号, 紧急程度分级, 状态机流转, 闭环关闭 |
 | 维修记录录入 | 针对故障单登记维修过程 | 自动生成维修单号, 开工/完工时间, 耗材与费用, 四种维修结果 |
+| 维修费用结算 | 维修费用台账与按月结算 | 按班组+完工月份归集费用, 提交/驳回/重提留痕, 版本快照与差异对比, 已结算月份锁定 |
 | 维修状态查询 | 只读的综合看板与追踪视图 | 全局概览, 路灯级维修状态列表, 按故障单号/路灯编号的全链路时间线 |
 
-四个模块在后端是四个平级的独立包 (`internal/modules/{lamp,fault,repair,status}`), 在前端是四组独立的视图与子组件, 互不耦合; 新增一个业务模块只需要实现 `module.Module` 接口并注册。
+五个模块在后端是五个平级的独立包 (`internal/modules/{lamp,fault,repair,settlement,status}`), 在前端是五组独立的视图与子组件, 互不耦合; 新增一个业务模块只需要实现 `module.Module` 接口并注册。
 
 ---
 
@@ -45,6 +46,7 @@
 │   │   │   ├── lamp/                     #   路灯台账
 │   │   │   ├── fault/                    #   故障登记
 │   │   │   ├── repair/                   #   维修记录录入
+│   │   │   ├── settlement/               #   维修费用结算(台账/结算单/版本快照/流转)
 │   │   │   └── status/                   #   维修状态查询(只读, 不建表)
 │   │   ├── response/                     # 统一响应信封 Envelope / PageData / OK / Fail
 │   ├── pkg/pagination/                   # 分页与排序参数(排序字段白名单)
@@ -68,6 +70,7 @@
 │   │       ├── lamp/LampListView.vue + components/LampFormDialog.vue
 │   │       ├── fault/FaultListView.vue + components/{FaultFormDialog,FaultDetailDrawer}.vue
 │   │       ├── repair/RepairListView.vue + components/{RepairFormDialog,FinishRepairDialog}.vue
+│   │       ├── settlement/SettlementListView.vue + components/{CreateSettlementDialog,SettlementFlowDialog,SettlementDetailDrawer}.vue
 │   │       └── status/{StatusLampView,StatusTrackView}.vue
 │   ├── nginx.conf                        # 生产: SPA 回退 + /api 反向代理
 │   ├── Dockerfile
@@ -105,10 +108,12 @@ modules/<name>/
 lamp.New(db)                                   -> 路灯台账(无依赖)
 fault.New(db, lampService)                     -> 故障登记(读取路灯校验)
 repair.New(db, faultService)                   -> 维修记录(驱动故障状态流转)
+settlement.New(db)                             -> 费用结算(归集维修费用)
+repair.Service().SetSettlementLock(settlement) -> 已结算月份反向锁定维修记录
 status.New(db, lampRepo, faultRepo, repairRepo)-> 维修状态查询(只读聚合)
 ```
 
-路灯运行状态需要根据故障反向回填, 但 `lamp` 不能依赖 `fault`, 因此用 `lampService.SetOpenFaultCounter(faultModule.Repository())` 注入一个统计端口, 避免构造函数循环依赖。
+路灯运行状态需要根据故障反向回填, 但 `lamp` 不能依赖 `fault`, 因此用 `lampService.SetOpenFaultCounter(faultModule.Repository())` 注入一个统计端口; 同理, 已结算月份不允许改动维修记录, 用 `repairService.SetSettlementLock(settlementModule.Service())` 注入锁定端口, 均避免构造函数循环依赖。
 
 ### 3.3 统一响应与错误
 
@@ -282,7 +287,24 @@ go test ./...
 | GET | `/repairs/:id` | 详情 |
 | PUT | `/repairs/:id` | 修改 |
 | POST | `/repairs/:id/finish` | 完工(写入完工时间与维修结果) |
-| DELETE | `/repairs/:id` | 删除(会重算故障的维修次数) |
+| DELETE | `/repairs/:id` | 删除(会重算故障的维修次数; 已结算月份记录拒绝删除) |
+
+### 维修费用结算
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/settlements` | 结算单分页查询(结算单号/班组/状态/月份) |
+| POST | `/settlements` | 按班组+完工月份建账(自动归集, 金额由服务端计算) |
+| GET | `/settlements/meta` | 字典: 状态/动作 + 可建账班组与月份 |
+| GET | `/settlements/ledger` | 费用台账: 已完工维修记录及其结算/锁定状态 + 汇总 |
+| GET | `/settlements/preview` | 建账前预览归集明细(不落库) |
+| GET | `/settlements/:id` | 详情: 当前版本明细 + 流转记录 + 实时归集差异标记 |
+| DELETE | `/settlements/:id` | 删除(仅草稿/已驳回) |
+| POST | `/settlements/:id/submit` | 提交审核(草稿 → 待审核) |
+| POST | `/settlements/:id/reject` | 驳回(必须填写驳回原因) |
+| POST | `/settlements/:id/resubmit` | 驳回后重新提交(重新归集, 生成新版本快照) |
+| POST | `/settlements/:id/approve` | 审核通过(月份锁定) |
+| GET | `/settlements/:id/diff` | 版本差异对比, 参数 `from_version` / `to_version` |
 
 ### 维修状态查询
 
@@ -305,6 +327,15 @@ go test ./...
 - **删除路灯** 会被未闭环故障拦截; **删除故障** 要求已关闭且没有维修记录。
 - **逾期判定**: 上报超过 24 小时仍未闭环的故障计入概览的逾期清单。
 
+### 费用结算规则
+
+- **归集口径**: 按「维修班组 + 完工时间所在月(YYYY-MM)」归集该班组当月**已完工**维修记录; 结算金额由服务端实时汇总 `cost` 得到, 前端不可填写, 保证结算金额与维修记录费用合计一致。
+- **唯一约束**: 同一班组同一月份只允许一张结算单(数据库联合唯一索引), 该月份无已完工记录时不允许建账。
+- **状态机**: `草稿(draft) -> 待审核(submitted) -> 已通过(approved) / 已驳回(rejected)`; 驳回后只能「重新提交」(再次进入待审核), 已通过为终态; 草稿与已驳回可以删除, 待审核/已通过不可删除。
+- **流转留痕**: 建账/提交/驳回/重提/通过每一步都写入流水(`settlement_flow`), 记录操作人、原因、当时版本、条数与金额; **驳回必须填写原因**。
+- **版本快照与差异**: 每次提交都把当时明细固化为一个版本(`settlement_item`), 驳回重提生成新版本而不覆盖历史; 版本对比接口逐条标出新增/移除/费用变更及金额差。
+- **月份锁定**: 结算单一旦「待审核」, 该班组该月维修记录即不允许完工入账或删除(返回 409); 「已通过」后永久锁定; 驳回后解锁以便修正维修记录。该约束通过 `repair.SetSettlementLock` 反向端口实现。
+
 ---
 
 ## 九、演示数据
@@ -312,7 +343,8 @@ go test ./...
 `APP_SEED=true`(默认)且库中还没有台账数据时, 首次启动会写入一组演示数据, 打开页面即可看到效果:
 
 - 6 条道路, 每条 5 盏路灯, 共 **30 盏**, 覆盖 `正常 / 故障 / 维修中 / 停用` 四种运行状态;
-- **14 条故障**, 覆盖待处理 / 维修中 / 已修复 / 已关闭四种状态, 其中包含 2 条已逾期;
-- **12 条维修记录**, 含进行中与已完工, 带耗材、费用与维修结果。
+- **19 条故障**, 覆盖待处理 / 维修中 / 已修复 / 已关闭四种状态, 其中包含 2 条已逾期;
+- **17 条维修记录**, 含进行中与已完工, 带耗材、费用与维修结果;
+- **3 张费用结算单**: 上月二班(驳回 → 调整维修记录班组 → 重提 → 通过, 含 2 个版本与差异)、上月一班(已通过, 月份已锁定)、本月一班(待审核)。
 
 想从空库开始, 把 `APP_SEED` 设为 `false`, 或删除数据卷后重启。
